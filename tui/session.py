@@ -8,12 +8,14 @@ import os
 import re
 import shlex
 import time
+import traceback
 from datetime import date, datetime, timezone
 from contextlib import aclosing
 from pathlib import Path
 import tempfile
 from typing import Any, Callable
 from urllib.parse import urlsplit
+import webbrowser
 
 from pygments.token import Token
 from pygments.util import ClassNotFound
@@ -51,8 +53,19 @@ from mitsu.workspace.intel import (
     upsert_manhunt,
     upsert_observation,
 )
-from mitsu.workspace.surface_map import create_surface_map
-from mitsu.providers import ProviderRequestError, check_image_input_support, check_reasoning_support
+from mitsu.workspace.surface_map import build_surface_graph, create_surface_map
+from mitsu.workspace.assessment_report import (
+    create_assessment_report,
+    open_assessment_pdf,
+    report_model_context,
+)
+from mitsu.providers import (
+    ProviderRequestError,
+    RequestCancellation,
+    check_image_input_support,
+    check_reasoning_support,
+    request_agent_turn,
+)
 from mitsu.tui.images import (
     IMAGE_TOKEN,
     prepare_image_prompt,
@@ -228,6 +241,9 @@ class PromptTextArea(TextArea):
         self._workspace_files: list[Path] | None = None
         self.image_attachments: dict[str, Path] = {}
         self._last_paste: tuple[str | bytes, float] | None = None
+        self.message_history: list[str] = []
+        self.history_index: int | None = None
+        self.history_draft = ""
 
     class Submitted(Message):
         def __init__(self, prompt: str) -> None:
@@ -244,6 +260,10 @@ class PromptTextArea(TextArea):
                 self.action_complete_slash_command()
                 return
         prompt = self.text
+        if prompt.strip() and (not self.message_history or self.message_history[-1] != prompt):
+            self.message_history.append(prompt)
+        self.history_index = None
+        self.history_draft = ""
         self.clear()
         self.post_message(self.Submitted(prompt))
 
@@ -251,6 +271,8 @@ class PromptTextArea(TextArea):
         self.insert("\n")
 
     def action_clear_input(self) -> None:
+        self.history_index = None
+        self.history_draft = ""
         self.clear()
         self.image_attachments.clear()
         self.focus()
@@ -283,7 +305,23 @@ class PromptTextArea(TextArea):
         self.cursor_location = (len(preceding) - 1, len(preceding[-1]))
         self.focus()
 
+    def set_message_history(self, messages: list[str]) -> None:
+        self.message_history = [message for message in messages if message.strip()]
+        self.history_index = None
+        self.history_draft = ""
+
+    def _show_history_entry(self, index: int) -> None:
+        if self.history_index is None:
+            self.history_draft = self.text
+        self.history_index = index
+        self.text = self.message_history[index]
+        lines = self.text.splitlines() or [""]
+        self.cursor_location = (len(lines) - 1, len(lines[-1]))
+
     def action_cursor_up(self, select: bool = False) -> None:
+        if not select and self.history_index is not None:
+            self._show_history_entry(max(0, self.history_index - 1))
+            return
         if self.file_suggestions and not select:
             self.file_suggestion_index = (self.file_suggestion_index - 1) % len(self.file_suggestions)
             self.post_message(self.FileSuggestionsChanged())
@@ -292,9 +330,23 @@ class PromptTextArea(TextArea):
             self.slash_suggestion_index = (self.slash_suggestion_index - 1) % len(self.slash_suggestions)
             self.post_message(self.SlashSuggestionsChanged())
             return
+        if not select and self.message_history and self.cursor_location[0] == 0:
+            index = len(self.message_history) - 1 if self.history_index is None else max(0, self.history_index - 1)
+            self._show_history_entry(index)
+            return
         super().action_cursor_up(select)
 
     def action_cursor_down(self, select: bool = False) -> None:
+        if not select and self.history_index is not None:
+            next_index = self.history_index + 1
+            if next_index >= len(self.message_history):
+                self.history_index = None
+                self.text = self.history_draft
+                lines = self.text.splitlines() or [""]
+                self.cursor_location = (len(lines) - 1, len(lines[-1]))
+            else:
+                self._show_history_entry(next_index)
+            return
         if self.file_suggestions and not select:
             self.file_suggestion_index = (self.file_suggestion_index + 1) % len(self.file_suggestions)
             self.post_message(self.FileSuggestionsChanged())
@@ -1025,6 +1077,9 @@ class AskUserDialog(ModalScreen[str]):
             yield Static("↑ / ↓ choose    Type on Other    Enter answer    Esc skip", id="ask-user-hint", markup=False)
 
     def on_mount(self) -> None:
+        self.call_after_refresh(self._focus_answer)
+
+    def _focus_answer(self) -> None:
         if self.choices:
             self.query_one("#ask-user-choices", OptionList).focus()
         else:
@@ -1147,7 +1202,7 @@ class OperatorDialog(ModalScreen[str | None]):
             )
 
     def on_mount(self) -> None:
-        self._focus_question(0)
+        self.call_after_refresh(self._focus_question, 0)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "operator-dialog-next":
@@ -1295,6 +1350,24 @@ class ShowCommandDialog(ModalScreen[bool]):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+
+class SessionLogsDialog(ModalScreen[None]):
+    BINDINGS = [Binding("escape", "close", "Close", priority=True)]
+
+    def __init__(self, logs: str) -> None:
+        super().__init__()
+        self.logs = logs
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="session-logs-dialog"):
+            yield Static("SESSION LOGS", id="session-logs-title", markup=False)
+            with VerticalScroll(id="session-logs-scroll"):
+                yield Static(self.logs, id="session-logs-content", markup=False)
+            yield Static("Esc close", id="session-logs-hint", markup=False)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
 
 
 class VulnSearchDialog(ModalScreen[None]):
@@ -1844,6 +1917,7 @@ class SessionScreen(Screen):
     BINDINGS = [
         Binding("ctrl+b", "toggle_chat_history", "Chat history", priority=True),
         Binding("ctrl+f", "search_chat", "Find in chat", priority=True),
+        Binding("ctrl+t", "show_logs", "Logs", priority=True),
         Binding("escape", "cancel_agent", "Stop / latest", priority=True),
         Binding("shift+tab", "cycle_mode", "Switch mode", priority=True),
         Binding("pageup", "scroll_chat_up", "Scroll chat up", priority=True),
@@ -1980,6 +2054,11 @@ class SessionScreen(Screen):
             surface_map_handler=self._generate_surface_map,
         )
         self._closing_session = False
+        self._map_cancel: RequestCancellation | None = None
+        self._map_task: asyncio.Task[None] | None = None
+        self._map_logs: list[str] = []
+        self._report_cancel: RequestCancellation | None = None
+        self._report_task: asyncio.Task[None] | None = None
         self._session_cleanup_task: asyncio.Task | None = None
         self._tool_connection_task: asyncio.Task | None = None
         self._tool_reconnect_task: asyncio.Task | None = None
@@ -2027,7 +2106,7 @@ class SessionScreen(Screen):
             with VerticalScroll(id="session-left"):
                 yield MitsuCompanion(sprite_path=self.companion_path, id="session-companion")
                 yield Static("Mitsu is Ready to Pwn!", id="companion-status", markup=False)
-                yield Static(self._last_activity, id="activity-summary", markup=False)
+                yield Static(self._last_activity, id="activity-text", markup=False)
                 yield Static("Workspace", classes="session-label", markup=False)
                 yield Static(str(self.workspace), id="project-path", markup=False)
                 yield Static("Investigation intensity:", classes="session-label", markup=False)
@@ -2097,6 +2176,12 @@ class SessionScreen(Screen):
 
     def on_mount(self) -> None:
         self._update_context()
+        prompt_history = [
+            str(entry.get("text", "")).removeprefix("›  ")
+            for entry in self.session.get("messages", [])
+            if isinstance(entry, dict) and entry.get("role") == "user" and str(entry.get("text", "")).strip()
+        ]
+        self.query_one("#prompt-input", PromptTextArea).set_message_history(prompt_history)
         self._update_search_sidebar()
         self.call_after_refresh(self._scroll_to_latest_message)
         self.call_after_refresh(self._focus_prompt)
@@ -2170,7 +2255,7 @@ class SessionScreen(Screen):
         else:
             label.display = False
             status.display = False
-            hint.update("Enter send    Shift+Enter new line    Shift+Tab mode    Esc stop    Ctrl+B chat history")
+            hint.update("↑/↓ prompts    Enter send    Shift+Enter new line    Shift+Tab mode    Esc stop    Ctrl+B chat history")
 
     def on_click(self, _event: Click) -> None:
         self.call_after_refresh(self._focus_prompt)
@@ -2200,9 +2285,20 @@ class SessionScreen(Screen):
             mascot.set_modal_suspended(False)
 
     async def on_unmount(self) -> None:
-        await self.close_session()
+        try:
+            await asyncio.wait_for(self.close_session(), timeout=3)
+        except TimeoutError:
+            self.app.log.error("Session cleanup exceeded the 3 second unmount deadline.")
 
     async def close_session(self) -> None:
+        if self._map_cancel is not None:
+            self._map_cancel.cancel()
+        if self._map_task is not None and not self._map_task.done():
+            self._map_task.cancel()
+        if self._report_cancel is not None:
+            self._report_cancel.cancel()
+        if self._report_task is not None and not self._report_task.done():
+            self._report_task.cancel()
         if self._session_cleanup_task is None:
             self._closing_session = True
             self._queued_prompts.clear()
@@ -2380,6 +2476,9 @@ class SessionScreen(Screen):
         if not prompt:
             return
         if prompt.startswith("/") and not self._dispatching_prompt:
+            suggestions = self.query_one("#slash-suggestions", OptionList)
+            suggestions.display = False
+            suggestions.clear_options()
             await self._dispatch_prompt(prompt)
             self.call_after_refresh(self._focus_prompt)
             return
@@ -2506,6 +2605,8 @@ class SessionScreen(Screen):
                         and command not in {
                             "/search",
                             "/clear",
+                            "/map",
+                            "/report",
                             "/level",
                             "/mode",
                             "/export",
@@ -3237,7 +3338,10 @@ class SessionScreen(Screen):
                             )
                             // 4,
                         )
-                        self._set_activity(self._tool_activity(name, arguments, failed=failed))
+                        self._set_activity(
+                            self._tool_activity(name, arguments, failed=failed),
+                            success=name.endswith("__surface_map") and not failed,
+                        )
                         await self._append_message(result, "tool-result", tool_failed=failed)
                         if failed:
                             self._set_companion("failed", "Tool failed", reset_after=1.5)
@@ -4596,72 +4700,274 @@ class SessionScreen(Screen):
             widget.remove_class("search-hit", "search-current")
 
     async def _report_command(self) -> None:
-        targets = self.targets or []
-        findings = self.findings or []
-        exploits = self.exploits or []
-        ips = self.ips or []
-        harvested = self.harvested_data or []
-        title = str(self.session.get("title", "Untitled session"))
-        summary = str(self.session.get("summary", "") or "").strip()
-        lines = [
-            f"VULNERABILITY ASSESSMENT · {title}",
-            f"Generated {__version__} from Mitsu session data.",
-            "",
-            "EXECUTIVE SUMMARY",
-            (
-                f"The session contains {len(findings)} recorded finding(s) across {len(targets)} scoped target(s)."
-                if findings else "No findings are recorded in this session. This is not evidence that the target is secure."
-            ),
-            *( ["", "SESSION SUMMARY", summary] if summary else [] ),
-            "",
-            "SCOPE",
+        if self._report_task is not None and not self._report_task.done():
+            return
+        self._set_activity("Building artifact...")
+        self._report_task = asyncio.create_task(self._build_report_artifact())
+
+    async def _build_report_artifact(self) -> None:
+        try:
+            session_snapshot = copy.deepcopy(self.session)
+            report_html = await self.generateReportHTML(session_snapshot)
+            artifact = await asyncio.to_thread(
+                create_assessment_report,
+                session_snapshot,
+                self.sessions.path,
+                report_html,
+            )
+            if self._closing_session:
+                return
+            if artifact["pdf_path"]:
+                opened = await asyncio.to_thread(open_assessment_pdf, artifact["pdf_path"], artifact["html_path"])
+                if opened == "pdf":
+                    self._set_activity("Assessment report ready! Opening the PDF.", success=True)
+                else:
+                    self._set_activity("PDF app unavailable. Opened the report in your browser.", success=True)
+            else:
+                await asyncio.to_thread(webbrowser.open_new_tab, Path(artifact["html_path"]).resolve().as_uri())
+                self._set_activity("Report HTML ready; PDF conversion failed. Opened it in your browser.", success=True)
+                if artifact.get("conversion_error"):
+                    self._map_logs.append(f"PDF export: {artifact['conversion_error']}")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if self._closing_session:
+                return
+            self._record_map_error("report")
+            if self._map_logs and ("timed out" in self._map_logs[-1].casefold() or "timeout" in self._map_logs[-1].casefold()):
+                self._set_activity("The AI provider timed out before the report was ready. Press ^T to see logs.")
+            else:
+                self._set_activity("Mitsu couldn’t build the assessment report. Press ^T to see logs.")
+
+    async def generateReportHTML(self, session: dict[str, Any]) -> str:
+        context = await asyncio.to_thread(report_model_context, session)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Create a client-ready, target-specific security assessment report as an HTML fragment using only the supplied redacted session Intel. "
+                    "Generate the report structure for this engagement; do not return JSON, Markdown, CSS, scripts, or an outer html/head/body document. "
+                    "Use a restrained professional print-report style: white page, navy headings, muted blue rules, clear severity colors, readable typography, concise prose, numbered sections, and useful whitespace. Write findings as short narrative sections with evidence and remediation paragraphs. Use prose and short lists for explanation; reserve tables for at most two compact summaries. Do not make each finding or section a table. "
+                    "The report is a finished deliverable. Never label it draft or for review. The renderer supplies the cover; do not create one in the generated body. The cover contains only the report title and target subtitle beneath Mitsu branding, over the supplied cover artwork. Keep recorded assessment dates, scope, client, assessor, and other engagement details in appropriate sections. Omit fields that are not recorded instead of printing empty placeholders such as ‘Authorization: Not recorded’. Do not invent another company or logo. "
+                    "Do not generate a Table of Contents; the report builder adds it as page 2. Use h1/h2/h3 in a consistent hierarchy: major report sections as h1, subsections as h2, and finding-level headings as h3. "
+                    "The renderer writes the Objectives and Scope section from the recorded target list and explicit scope flags; do not write another scope section. Order the generated report as executive summary; assessment window and material constraints; assessment approach and test sequence; concise target-specific results; remediation priorities; limitations; and conclusion. Omit sections that have no supporting evidence. Include a retest section only when retest activity is recorded. The renderer adds the detailed finding writeups and concise appendices. Create a distinct, tailored results subsection for each target using only that target's recorded assets, evidence, findings, and remediation needs. Explain the sequence of validated tests in plain language and distinguish attempted, blocked, and successful actions. Omit unverified activity and unverified leads. Do not repeat renderer-supplied charts or appendices. "
+                    "In the main results, summarize the overall pattern and list only the three highest-priority confirmed finding titles, recorded severity, and brief target-specific consequence. Do not expand every finding here. Do not repeat full metadata, raw evidence, or remediation; the renderer creates the technical writeup for each confirmed finding in the Detailed Findings section. It uses saved summary, proof/evidence, impact if present, and recommendation. "
+                    "A security finding must describe a confirmed weakness that crosses a security boundary and has a consequence supported by evidence. A recorded severity is not proof of vulnerability. Never present Informational records as vulnerabilities or findings. Mention useful defensive controls, such as a WAF blocking a request or access controls denying an unauthorized write, only as brief context; the renderer supplies the compact Controls Observed note. Do not count them as findings or recommend changing a control that is working unless Intel records a specific adverse effect. Exclude all unverified leads, candidate CVEs, scan-only matches, and ordinary product behavior without demonstrated security impact from the client-facing report. Do not label such material as suspected, potential, unverified, or owner-review items; keep it in session Intel only. "
+                    "Firebase Web API keys and project IDs are client-visible identifiers and are not authorization credentials or secrets by themselves. Do not call their presence in a client bundle a vulnerability, recommend removing the Firebase config, or recommend rotating a Firebase key solely because it is visible. Firebase data access is controlled by Security Rules, App Check, and IAM. Report a Firebase issue only when the evidence demonstrates unauthorized data access, a policy violation, abuse beyond intended public behavior, or another concrete security impact. Public account registration and successful password-reset-code requests are not vulnerabilities by themselves; do not claim email enumeration unless the evidence distinguishes existing from non-existing accounts, and do not claim missing rate limits unless testing demonstrates the limit is absent. When those checks have no evidence of security impact, omit them from the deliverable. "
+                    "Consolidate repeated evidence of the same root cause into one finding. Do not promote a project identifier, normal public API behavior, a blocked attempt, or an unverified CVE into a vulnerability. Separate a failed or prevented exploit from a successful exploit. "
+                    "Distinguish a tool or exploit attempt from a successful exploit. Never turn an observation or lead into a confirmed vulnerability. State when evidence does not establish successful exploitation or impact. "
+                    "Do not include internal session controls or modes, including names such as AutoPwn or Chill. Do not repeat raw JSON or internal field names in the narrative. "
+                    "The renderer adds a branded cover, page-2 contents, grouped target-specific finding cards, a compact asset register, a short validated test activity register, and a brief controls-observed note when useful. The complete raw Intel stays in the session and is not copied into the PDF. Use only supplied reportable findings and representative validated records in the narrative. If no confirmed vulnerabilities are recorded, state that no confirmed vulnerabilities were established from the recorded testing; do not list leads or speculate. Keep the generated body concise, aiming for 600 words total. Do not write a separate detailed findings section, a second finding list, appendices, table of contents, or cover page. Do not mention the renderer or describe how the PDF was assembled. "
+                    "Treat recorded severity, confidence, verification and scope values as source labels, not independent validation. State the assessment's risk-rating basis and disclose when severity labels were copied from session Intel rather than recalculated. Do not invent CVSS scores, business impact, dates, client identity, assessor identity, authorization, tests, proof of concept, or remediation. Omit absent details unless their absence materially limits interpretation; if it does, explain the limitation briefly without adding generic placeholder fields. "
+                    "Use varied presentation: concise narrative for process and findings, a short prioritized remediation list, and no more than two compact tables. Use a risk-based reporting approach informed by NIST SP 800-115 and ISO/IEC 27005 concepts, but do not claim conformance, certification, or an ISO-mandated report template. Do not describe this as a Cisco standard. "
+                    "Use only the facts and recommendations in the provided Intel. Do not expose secrets, personal emails, tokens, API keys, or credentials. Do not add remote links, images, fonts, stylesheets, or resources. "
+                    "Scope and evidence rules: reporting_scope.operator_targets and reporting_scope.explicit_in_scope_assets define the only stated scope. A discovered IP address, API route, cloud project, service, or third-party provider is not automatically in scope; do not imply it was authorized or assessed unless Intel explicitly says so. List exclusions only from reporting_scope.explicit_exclusions. Do not mention absent authorization letters, rules-of-engagement documents, or missing client fields. Never invent scope boundaries, test actions, dates, results, or impact. Describe WAF responses as requests blocked under the observed test conditions; do not claim that the WAF prevents all abuse or proves backend authorization. A 404 response does not prove that a database is securely configured or even provisioned. "
+                    "Finding quality: a token parameter name, placeholder such as <JWT>, or redacted pattern is not proof that a live credential was captured. Do not report token exposure as a confirmed finding unless Intel documents a real captured value or validated use. Do not treat a public Firebase API key, project ID, successful public registration, or password-reset request as a vulnerability without evidence of unauthorized access, policy violation, abuse, or other concrete security impact. Do not recommend removing or rotating a public Firebase API key solely because it is client-visible. Keep risk statements proportional to reproduced impact, and distinguish confirmed impact from plausible consequences. "
+                    "The shared document wrapper adds Mitsu's logo, framework name, print styling, and page numbers. Return only the HTML fragment. Use ordinary semantic HTML with sections, headings, paragraphs, lists, and target-specific tables; no inline CSS, links, scripts, or remote resources. You may use class=cover, class=toc-title, and table width, colspan, or rowspan attributes."
+                ),
+            },
+            {"role": "user", "content": json.dumps(context, ensure_ascii=False, default=str)},
         ]
-        lines.extend(f"• {target}" for target in targets) if targets else lines.append("No target was recorded.")
-        lines.extend(["", "FINDINGS"])
-        lines.extend(f"• {item}" for item in findings) if findings else lines.append("No findings recorded.")
-        lines.extend(["", "EXPLOIT REFERENCES"])
-        lines.extend(f"• {item}" for item in exploits) if exploits else lines.append("No exploit references were recorded.")
-        lines.extend(["", "OBSERVED IP ADDRESSES"])
-        lines.extend(f"• {item}" for item in ips) if ips else lines.append("No IP addresses recorded.")
-        lines.extend(["", "HARVESTED DATA"])
-        lines.extend(f"• {item}" for item in harvested) if harvested else lines.append("No harvested data recorded.")
-        lines.extend([
-            "",
-            "LIMITATIONS",
-            "This report only summarizes data explicitly stored in the session. It does not infer or validate findings, and tool output that was not added to session intel may be absent.",
-        ])
-        self._set_activity("Generated a report from recorded session intel.")
-        await self._append_message("\n".join(lines))
+        cancel = RequestCancellation()
+        self._report_cancel = cancel
+        report_provider = dict(self.provider)
+        report_provider["reasoning_enabled"] = False
+
+        def validate_report(turn: Any) -> None:
+            raw = turn.text.strip()
+            if raw.startswith("```"):
+                raw = raw.partition("\n")[2].rsplit("```", 1)[0].strip()
+            if re.search(r"<(?:html|main|section|h1|div)\b", raw, flags=re.IGNORECASE) is None:
+                raise ValueError("The model did not return an HTML assessment report.")
+
+        try:
+            turn = await self._request_artifact_turn(
+                report_provider,
+                messages,
+                cancel,
+                "Report",
+                max_tokens=3_000,
+                validate=validate_report,
+            )
+        finally:
+            if self._report_cancel is cancel:
+                self._report_cancel = None
+        raw = turn.text.strip()
+        if raw.startswith("```"):
+            raw = raw.partition("\n")[2].rsplit("```", 1)[0].strip()
+        html_start = re.search(r"<(?:html|main|section|h1|div)\b", raw, flags=re.IGNORECASE)
+        if html_start is None:
+            raise ValueError("The model did not return an HTML assessment report.")
+        return raw[html_start.start():]
 
     async def _map_command(self) -> None:
-        self._set_activity("Building an attack surface map from session Intel…")
-        try:
-            result = await self._generate_surface_map()
-        except (OSError, ValueError) as error:
-            await self._fail(f"Could not create the attack surface map: {error}", "Map generation failed")
+        if self._map_task is not None and not self._map_task.done():
             return
-        self._set_activity("Attack surface map is ready.")
-        map_uri = Path(result["path"]).resolve().as_uri()
-        await self._append_message(
-            "Attack surface map ready! (✧ω✧)\n\n"
-            f"**{result['node_count']} nodes · {result['edge_count']} recorded relationships**\n\n"
-            f"[Open the interactive map]({map_uri})\n\n"
-            "It uses saved Intel and leaves unsupported relationships unconnected."
-        )
+        self._set_activity("Building artifact...")
+        self._map_task = asyncio.create_task(self._build_map_artifact())
+
+    async def _build_map_artifact(self) -> None:
+        try:
+            await self._generate_surface_map()
+        except Exception:
+            if self._closing_session:
+                return
+            self._set_activity("Mitsu couldn’t build the attack surface map. Press ^T to see logs.")
+
+    def action_show_logs(self) -> None:
+        logs = "\n\n".join(self._map_logs) or "No artifact errors have been logged in this session."
+        self.app.push_screen(SessionLogsDialog(logs))
+
+    def _record_map_error(self, artifact_type: str = "map") -> None:
+        detail = traceback.format_exc()
+        now = datetime.now().astimezone()
+        stamp = now.isoformat(timespec="seconds")
+        log_path = Path(tempfile.gettempdir()) / f"mitsu-{artifact_type}-error-{now.strftime('%Y%m%d-%H%M%S-%f')}.log"
+        message = f"Log saved at {log_path}:\n\n{detail}"
+        try:
+            log_path.write_text(message, encoding="utf-8")
+            log_path.chmod(0o600)
+        except OSError as error:
+            message = f"Could not save map error log at {log_path}: {error}\n\n{detail}"
+        self._map_logs.append(f"[{stamp}] {message}")
+        del self._map_logs[:-10]
+        self.log.error("Mitsu %s artifact failed\n%s", artifact_type, detail)
 
     async def _generate_surface_map(
         self,
-        extra_nodes: list[dict[str, Any]] | None = None,
         connections: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        self._set_activity("Building artifact...")
         session_snapshot = copy.deepcopy(self.session)
-        return await asyncio.to_thread(
-            create_surface_map,
-            session_snapshot,
-            self.sessions.path,
-            extra_nodes,
-            connections,
-        )
+        try:
+            mapPlan = await self.planMap(session_snapshot)
+            if connections:
+                mapPlan["connections"].extend(connections)
+            result = await asyncio.to_thread(
+                create_surface_map,
+                session_snapshot,
+                self.sessions.path,
+                mapPlan,
+            )
+            map_uri = Path(result["path"]).resolve().as_uri()
+            await asyncio.to_thread(webbrowser.open_new_tab, map_uri)
+            self._set_activity("Artifact built!\nOpening in your browser the map artifact!", success=True)
+            return result
+        except Exception:
+            self._record_map_error()
+            raise
+
+    async def planMap(
+        self,
+        session: dict[str, Any],
+    ) -> dict[str, Any]:
+        graph = await asyncio.to_thread(build_surface_graph, session)
+        context = {
+            "title": graph["title"],
+            "nodes": [
+                {key: node.get(key) for key in ("id", "label", "category", "kind", "details")}
+                for node in graph["nodes"]
+            ],
+            "recorded_links": graph["edges"],
+            "intel": session.get("intel", {}),
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Prepare readable detail panels and evidence-backed relationships for this attack-surface map. "
+                    "The entity list is fixed; do not add or remove entities. For every entity, deduplicate repeated "
+                    "Intel, summarize it in plain language, and group useful fields into short sections. Convert "
+                    "serialized evidence records into readable statements that preserve source and timestamp when "
+                    "available. Never return JSON serialized inside a value. Do not invent facts. If records disagree, "
+                    "show the conflict and its timestamps instead of choosing one value. Keep observations, findings, "
+                    "exploits, and account data in that entity's panel, never as graph entities. "
+                    "Only connect entities when saved Intel directly establishes the relationship. Do not infer links "
+                    "from matching names, shared networks, or plausibility. Return only JSON shaped as: "
+                    "{\"entities\":[{\"id\":\"existing id\",\"summary\":\"plain-language summary\","
+                    "\"sections\":[{\"title\":\"section\",\"items\":[{\"label\":\"field\","
+                    "\"value\":\"readable value\"}]}]}],\"connections\":[{\"source\":\"existing id\","
+                    "\"target\":\"existing id\",\"label\":\"relationship\",\"evidence\":\"exact quote from Intel\"}]}. "
+                    "Use concise sections such as Asset, Observations, Findings, Exploits, Accounts, and Evidence. "
+                    "Return an empty connections array when evidence does not establish a link."
+                ),
+            },
+            {"role": "user", "content": json.dumps(context, ensure_ascii=False, default=str)},
+        ]
+        cancel = RequestCancellation()
+        self._map_cancel = cancel
+
+        def validate_map(turn: Any) -> None:
+            raw = turn.text.strip()
+            if raw.startswith("```"):
+                raw = raw.partition("\n")[2].rsplit("```", 1)[0].strip()
+            try:
+                plan = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise ValueError("The model returned an unreadable map plan.") from error
+            if (
+                not isinstance(plan, dict)
+                or not isinstance(plan.get("entities", []), list)
+                or not isinstance(plan.get("connections", []), list)
+            ):
+                raise ValueError("The model returned invalid map details or relationships.")
+
+        try:
+            turn = await self._request_artifact_turn(
+                self.provider, messages, cancel, "Map", validate=validate_map
+            )
+        finally:
+            if self._map_cancel is cancel:
+                self._map_cancel = None
+        raw = turn.text.strip()
+        if raw.startswith("```"):
+            raw = raw.partition("\n")[2].rsplit("```", 1)[0].strip()
+        try:
+            plan = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ValueError("The model returned an unreadable map plan.") from error
+        if not isinstance(plan, dict):
+            raise ValueError("The model returned an invalid map plan.")
+        entities = plan.get("entities", [])
+        connections = plan.get("connections", [])
+        if not isinstance(entities, list) or not isinstance(connections, list):
+            raise ValueError("The model returned invalid map details or relationships.")
+        return {"entities": entities, "connections": connections}
+
+    async def _request_artifact_turn(
+        self,
+        profile: dict[str, Any],
+        messages: list[dict[str, Any]],
+        cancellation: RequestCancellation,
+        artifact_name: str,
+        max_tokens: int | None = None,
+        validate: Callable[[Any], None] | None = None,
+    ):
+        for attempt in range(11):
+            try:
+                turn = await asyncio.to_thread(
+                    request_agent_turn,
+                    profile,
+                    messages,
+                    [],
+                    cancellation=cancellation,
+                    on_event=lambda _event, _data: None,
+                    max_tokens=max_tokens,
+                )
+                if validate is not None:
+                    validate(turn)
+                return turn
+            except (ProviderRequestError, ValueError) as error:
+                if cancellation.cancelled() or attempt >= 10:
+                    raise
+                retry_number = attempt + 1
+                for remaining in range(10, 0, -1):
+                    if cancellation.cancelled():
+                        raise asyncio.CancelledError
+                    self._set_activity(
+                        f"{artifact_name} API Error {retry_number}/10 · Retrying in {remaining}s…"
+                    )
+                    await asyncio.sleep(1)
 
     async def _vulnsearch_command(self, query: str) -> None:
         label = query or "saved Intel"
@@ -5304,7 +5610,7 @@ CURRENT MODE: {self.mode}
             self._set_companion("error", "Something went wrong", reset_after=2.0)
         elif role == "success":
             self._set_companion("success", "Nice work!", reset_after=1.5)
-        if self._command_running and self._active_command != "/clear":
+        if self._command_running and self._active_command not in {"/clear", "/map"}:
             title = "Command error" if role == "error" else f"{self._active_command or 'Command'} result"
             self._show_command_panel(title, message)
             return
@@ -5617,10 +5923,12 @@ CURRENT MODE: {self.mode}
             else:
                 self._set_companion("idle", "Mitsu is Ready to Pwn!")
 
-    def _set_activity(self, activity: str) -> None:
+    def _set_activity(self, activity: str, success: bool = False) -> None:
         self._last_activity = activity
         if self.is_mounted and not self._closing_session:
-            self.query_one("#activity-summary", Static).update(activity)
+            widget = self.query_one("#activity-text", Static)
+            widget.update(activity)
+            widget.set_class(success, "is-success")
 
     def _tool_activity(self, name: str, arguments: object = None, failed: bool | None = None) -> str:
         normalized_name = name.casefold()
@@ -5668,8 +5976,8 @@ CURRENT MODE: {self.mode}
                 "Mitsu couldn’t search the artifact.",
             ),
             "surface_map": (
-                "Mitsu is mapping session Intel…",
-                "Mitsu finished the attack surface map.",
+                "Building artifact...",
+                "Artifact built!\nOpening in your browser the map artifact!",
                 "Mitsu couldn’t build the attack surface map.",
             ),
             "vulnsearch": (
@@ -5780,7 +6088,7 @@ CURRENT MODE: {self.mode}
             f"{len(self.intel['manhunt'])} people · {len(self.intel['observations'])} notes"
         )
         self.query_one("#intel-summary", Static).update(summary)
-        self.query_one("#activity-summary", Static).update(self._last_activity)
+        self.query_one("#activity-text", Static).update(self._last_activity)
         level_text = Text(
             f"{self.level}/5 · {LEVEL_NAMES[self.level]}",
             style=f"bold {THEMES.get(self.theme_id, THEMES['ember'])['accent']}",
