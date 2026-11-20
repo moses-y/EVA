@@ -32,6 +32,16 @@ def is_transient_provider_error(error: ProviderRequestError) -> bool:
             "could not reach the provider",
             "provider stream ended unexpectedly",
             "provider returned an unreadable streamed response",
+            "claude code request timed out",
+            "api error: 429",
+            "api error: 500",
+            "api error: 502",
+            "api error: 503",
+            "api error: 504",
+            "api error: 529",
+            "rate_limit_error",
+            "overloaded_error",
+            "temporarily unavailable",
         )
     )
 
@@ -156,18 +166,32 @@ def request_agent_turn(
     cancellation: RequestCancellation | None = None,
     max_tokens: int | None = None,
 ) -> ProviderTurn:
+    if profile.get("provider_id") == "openai" and profile.get("auth_method") == "codex_cli":
+        raise ProviderRequestError("OpenAI account turns must use the Codex CLI bridge.")
     protocol = profile.get("protocol", "openai")
     base_url = str(profile.get("base_url", "")).rstrip("/")
     model = str(profile.get("model", ""))
     api_key = str(profile.get("api_key", ""))
     if not model or (not base_url and protocol != "litellm"):
         raise ProviderRequestError("Provider setup is incomplete. Reopen provider setup from the main menu.")
+    auth_method = profile.get("auth_method")
+    if auth_method in {"account", "claude_code"} and str(profile.get("provider_id")) == "anthropic":
+        raise ProviderRequestError("Claude account requests must use the Claude Code bridge.")
+    if auth_method == "account" and str(profile.get("provider_id")) == "openai":
+        raise ProviderRequestError("OpenAI account sign-in has changed. Reconnect using the Codex CLI account option.")
     try:
         if protocol == "litellm":
             return _request_litellm_turn(profile, messages, tools, on_event, cancellation)
         if protocol == "anthropic":
             return _request_anthropic_turn(
-                base_url, model, api_key, messages, tools, on_event, cancellation, max_tokens
+                base_url,
+                model,
+                api_key,
+                messages,
+                tools,
+                on_event,
+                cancellation,
+                max_tokens,
             )
         return _request_openai_turn(
             base_url,
@@ -181,6 +205,7 @@ def request_agent_turn(
             on_event,
             cancellation,
             max_tokens,
+            str(profile.get("provider_id", "")),
         )
     except ProviderRequestError as error:
         message = _hide_secret(str(error), api_key)
@@ -199,6 +224,7 @@ def _request_openai_turn(
     on_event: StreamCallback | None = None,
     cancellation: RequestCancellation | None = None,
     max_tokens: int | None = None,
+    provider_id: str = "",
 ) -> ProviderTurn:
     endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
     headers = {"Content-Type": "application/json"}
@@ -211,6 +237,8 @@ def _request_openai_turn(
     }
     if tools:
         payload["tools"] = _openai_tools(tools)
+        if provider_id == "zai":
+            payload["tool_stream"] = True
     if max_tokens is not None:
         payload["max_tokens"] = max(1, int(max_tokens))
     if reasoning_parameter == "reasoning_effort" and reasoning_enabled:
@@ -578,7 +606,7 @@ def _request_anthropic_turn(
         headers["x-api-key"] = api_key
     system_messages = [str(message["content"]) for message in messages if message.get("role") == "system"]
     conversation = [
-        _anthropic_message(message)
+        dict(_anthropic_message(message))
         for message in messages
         if message.get("role") != "system"
     ]
@@ -635,11 +663,16 @@ def _anthropic_turn_from_response(
     if text and on_event is not None:
         on_event("delta", {"text": text})
     usage = response.get("usage")
+    stop_reason = str(response.get("stop_reason", "") or "")
+    response_info = {"finish_reason": stop_reason} if stop_reason else {}
+    if stop_reason == "refusal":
+        response_info["refusal"] = True
     return ProviderTurn(
         text,
         {"role": "assistant", "content": normalized_content},
         calls,
         usage if isinstance(usage, dict) else {},
+        response_info,
     )
 
 
@@ -706,6 +739,7 @@ def _request_anthropic_stream(
         return _anthropic_turn_from_response(decoded, on_event)
     blocks: dict[int, dict[str, Any]] = {}
     usage: dict[str, Any] = {}
+    stop_reason = ""
     reply_filter = _ReplyFilter()
     try:
         for raw_line in response:
@@ -755,6 +789,9 @@ def _request_anthropic_stream(
                 delta_usage = event.get("usage")
                 if isinstance(delta_usage, dict):
                     usage.update(delta_usage)
+                delta = event.get("delta")
+                if isinstance(delta, dict) and isinstance(delta.get("stop_reason"), str):
+                    stop_reason = delta["stop_reason"]
         if cancellation is not None and cancellation.cancelled():
             return ProviderTurn("", {"role": "assistant", "content": []}, [], usage)
     except (OSError, TimeoutError, ValueError) as error:
@@ -798,6 +835,10 @@ def _request_anthropic_stream(
         {"role": "assistant", "content": normalized_content},
         calls,
         usage,
+        {
+            **({"finish_reason": stop_reason} if stop_reason else {}),
+            **({"refusal": True} if stop_reason == "refusal" else {}),
+        },
     )
 
 
@@ -806,8 +847,22 @@ def send_chat(profile: dict[str, Any], messages: list[dict[str, str]]) -> str:
     base_url = str(profile.get("base_url", "")).rstrip("/")
     model = str(profile.get("model", ""))
     api_key = str(profile.get("api_key", ""))
+    provider_id = str(profile.get("provider_id", ""))
+    if provider_id == "openai" and profile.get("auth_method") == "codex_cli":
+        from mitsu.providers.codex_cli import complete
+
+        return complete(profile, messages)
     if not model or (not base_url and protocol != "litellm"):
         raise ProviderRequestError("Provider setup is incomplete. Reopen provider setup from the main menu.")
+    auth_method = profile.get("auth_method")
+    if auth_method == "claude_code" and provider_id == "anthropic":
+        from mitsu.providers.claude_code import complete
+
+        return complete(profile, messages)
+    if auth_method == "account" and provider_id == "anthropic":
+        raise ProviderRequestError("Claude account sign-in must use the Claude Code bridge. Reconnect the provider.")
+    if auth_method == "account" and provider_id == "openai":
+        raise ProviderRequestError("OpenAI account sign-in has changed. Reconnect using the Codex CLI account option.")
     try:
         if protocol == "litellm":
             turn = _request_litellm_turn(profile, messages, [], None, None)
@@ -834,8 +889,27 @@ def test_connection(profile: dict[str, Any]) -> str:
     protocol = profile.get("protocol", "openai")
     base_url = str(profile.get("base_url", "")).rstrip("/")
     api_key = str(profile.get("api_key", ""))
+    provider_id = str(profile.get("provider_id", ""))
+    auth_method = profile.get("auth_method")
+    if provider_id == "openai" and auth_method == "codex_cli":
+        from mitsu.providers.codex_cli import test_connection as test_codex_cli
+
+        return test_codex_cli(profile)
+    if auth_method == "claude_code" and provider_id == "anthropic":
+        from mitsu.providers.claude_code import test_connection as test_claude_code
+
+        return test_claude_code(profile)
+    if auth_method == "account" and provider_id == "anthropic":
+        raise ProviderRequestError("Claude account sign-in must use the Claude Code bridge. Reconnect the provider.")
+    if auth_method == "account" and provider_id == "openai":
+        raise ProviderRequestError("OpenAI account sign-in has changed. Reconnect using the Codex CLI account option.")
     if protocol == "litellm":
         return _test_litellm(profile)
+    if provider_id in {"zai", "mistral", "vercel_gateway", "ollama_cloud", "fireworks"}:
+        reply = send_chat(profile, [{"role": "user", "content": "Reply only with OK."}])
+        if not reply.strip():
+            raise ProviderRequestError("The provider accepted the request but returned no model reply.")
+        return "Connection succeeded. The model returned a reply."
     if not base_url:
         raise ProviderRequestError("Enter a provider base URL first.")
     if protocol == "anthropic":
@@ -881,8 +955,28 @@ def list_models(profile: dict[str, Any]) -> list[str]:
     base_url = str(profile.get("base_url", "")).rstrip("/")
     api_key = str(profile.get("api_key", ""))
     provider_id = str(profile.get("provider_id", ""))
+    auth_method = profile.get("auth_method")
+    if provider_id == "openai" and auth_method == "codex_cli":
+        from mitsu.providers.codex_cli import DEFAULT_MODEL, account_status
+
+        account_status()
+        return [DEFAULT_MODEL]
+    if auth_method == "claude_code" and provider_id == "anthropic":
+        from mitsu.providers.claude_code import CLAUDE_MODELS, account_status
+
+        account_status()
+        return list(CLAUDE_MODELS)
+    if auth_method == "account" and provider_id == "anthropic":
+        raise ProviderRequestError("Claude account sign-in must use the Claude Code bridge. Reconnect the provider.")
+    if auth_method == "account" and provider_id == "openai":
+        raise ProviderRequestError("OpenAI account sign-in has changed. Reconnect using the Codex CLI account option.")
     if protocol == "litellm":
         return _list_litellm_models(profile)
+    if provider_id in {"zai", "mistral", "vercel_gateway", "ollama_cloud", "fireworks"}:
+        model = str(profile.get("model", "")).strip()
+        if model:
+            return [model]
+        raise ProviderRequestError("Enter a model ID to use this provider.")
     if not base_url:
         raise ProviderRequestError("Enter a provider base URL first.")
     if provider_id == "cloudflare":
@@ -902,6 +996,10 @@ def list_models(profile: dict[str, Any]) -> list[str]:
         if api_key:
             headers["x-api-key"] = api_key
         cursor_parameter = "after_id"
+    elif account_auth and provider_id == "openai":
+        endpoint = "https://api.openai.com/v1/models"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        cursor_parameter = "after"
     else:
         endpoint = f"{base_url}/models"
         headers = {"Content-Type": "application/json"}
@@ -952,7 +1050,10 @@ def list_models(profile: dict[str, Any]) -> list[str]:
         if provider_id == "cloudflare" and decoded.get("success") is False:
             message = _response_error_detail(decoded) or "Cloudflare could not list available models."
             raise ProviderRequestError(_hide_secret(message, api_key))
-        if provider_id == "cloudflare":
+        if account_auth and provider_id == "openai":
+            items = decoded.get("models", [])
+            items = [item for item in items if isinstance(item, dict) and item.get("visibility") == "list"]
+        elif provider_id == "cloudflare":
             result = decoded.get("result", [])
             items = result.get("data", result.get("models", [])) if isinstance(result, dict) else result
         else:
@@ -964,7 +1065,9 @@ def list_models(profile: dict[str, Any]) -> list[str]:
             if isinstance(item, str):
                 model_id = item
             elif isinstance(item, dict):
-                model_id = item.get("id") or item.get("name") or item.get("model")
+                model_id = item.get("slug") if account_auth and provider_id == "openai" else (
+                    item.get("id") or item.get("name") or item.get("model")
+                )
             else:
                 model_id = None
             if isinstance(model_id, str) and model_id.strip():
@@ -999,6 +1102,8 @@ def check_reasoning_support(profile: dict[str, Any]) -> str | None:
     protocol = str(profile.get("protocol", "openai"))
     provider_id = str(profile.get("provider_id", ""))
     model = str(profile.get("model", ""))
+    if provider_id == "openai" and profile.get("auth_method") == "codex_cli":
+        return None
     if protocol == "anthropic":
         return None
     if protocol == "litellm":
@@ -1007,10 +1112,14 @@ def check_reasoning_support(profile: dict[str, Any]) -> str | None:
             return None
         # LiteLLM maps reasoning_effort onto each provider's own thinking controls.
         return "reasoning_effort" if supported else "unsupported"
+    if provider_id in {"zai", "mistral", "vercel_gateway", "ollama_cloud", "fireworks"}:
+        return None
     if provider_id == "nvidia_nim" and "nemotron-3-ultra" in model.casefold():
         return "nvidia_chat_template"
     base_url = str(profile.get("base_url", "")).rstrip("/")
     api_key = str(profile.get("api_key", ""))
+    if profile.get("auth_method") == "account" and provider_id == "openai":
+        raise ProviderRequestError("Reconnect OpenAI using the Codex CLI account option.")
     if not base_url or not model:
         raise ProviderRequestError("Provider setup is incomplete. Choose a provider and model first.")
     endpoint = f"{base_url}/models"
@@ -1044,7 +1153,7 @@ def check_reasoning_support(profile: dict[str, Any]) -> str | None:
         (
             item for item in items
             if isinstance(item, dict)
-            and str(item.get("id") or item.get("name") or item.get("model") or "") == model
+            and str(item.get("slug") or item.get("id") or item.get("name") or item.get("model") or "") == model
         ),
         None,
     )
@@ -1079,6 +1188,10 @@ def check_image_input_support(profile: dict[str, Any]) -> bool | None:
     base_url = str(profile.get("base_url", "")).rstrip("/")
     model = str(profile.get("model", ""))
     api_key = str(profile.get("api_key", ""))
+    if provider_id == "openai" and profile.get("auth_method") == "codex_cli":
+        return None
+    if profile.get("auth_method") == "account" and provider_id == "openai":
+        raise ProviderRequestError("Reconnect OpenAI using the Codex CLI account option.")
     if protocol == "litellm":
         return _litellm_capability("supports_vision", model)
     if not base_url or not model:
@@ -1138,7 +1251,7 @@ def check_image_input_support(profile: dict[str, Any]) -> bool | None:
         (
             item for item in items
             if isinstance(item, dict)
-            and str(item.get("id") or item.get("name") or item.get("model") or "").casefold()
+            and str(item.get("slug") or item.get("id") or item.get("name") or item.get("model") or "").casefold()
             == model.casefold()
         ),
         None,
@@ -1397,6 +1510,9 @@ def _response_error_detail(body: Any) -> str | None:
     if isinstance(error, dict):
         message = error.get("message")
         if isinstance(message, str) and message:
+            error_type = error.get("type") or error.get("code")
+            if error_type and message.casefold() == "error":
+                return f"{error_type}: {message}"
             return message
     elif isinstance(error, str) and error:
         return error
@@ -1454,7 +1570,7 @@ def _send_anthropic(
     if api_key:
         headers["x-api-key"] = api_key
     system_messages = [message["content"] for message in messages if message["role"] == "system"]
-    conversation = [message for message in messages if message["role"] != "system"]
+    conversation = [dict(message) for message in messages if message["role"] != "system"]
     payload = {"model": model, "max_tokens": 2048, "messages": conversation}
     if system_messages:
         payload["system"] = "\n\n".join(system_messages)

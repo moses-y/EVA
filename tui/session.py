@@ -1370,6 +1370,27 @@ class SessionLogsDialog(ModalScreen[None]):
         self.dismiss(None)
 
 
+class APIDebugDialog(ModalScreen[None]):
+    BINDINGS = [
+        Binding("ctrl+u", "close", "Close", priority=True),
+        Binding("escape", "close", "Close", priority=True),
+    ]
+
+    def __init__(self, logs: str) -> None:
+        super().__init__()
+        self.logs = logs
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="api-debug-dialog"):
+            yield Static("API DEBUG LOGS", id="api-debug-title", markup=False)
+            with VerticalScroll(id="api-debug-scroll"):
+                yield Static(self.logs, id="api-debug-content", markup=False)
+            yield Static("Ctrl+U / Esc close", id="api-debug-hint", markup=False)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class VulnSearchDialog(ModalScreen[None]):
     BINDINGS = [Binding("escape", "close", "Close", priority=True)]
 
@@ -1725,13 +1746,13 @@ class MessageActionsMenu(Vertical):
     def on_mount(self) -> None:
         self.query_one("#message-actions-options", OptionList).focus()
 
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+    async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id != "message-actions-options":
             return
         if not (0 <= event.option_index < len(self._actions)):
             return
         choice = self._actions[event.option_index]
-        self._remove()
+        await self._remove()
         if choice == "Copy":
             self._screen.app.copy_to_clipboard(self._message_text)
             self._screen.app.notify("Copied to clipboard", title="Copied")
@@ -1743,13 +1764,14 @@ class MessageActionsMenu(Vertical):
                 name=f"rewind-message-{self._message_index}",
             )
 
-    def _remove(self) -> None:
+    async def _remove(self) -> None:
         if getattr(self._screen, "_message_actions_menu", None) is self:
             self._screen._message_actions_menu = None
-        self.remove()
+        if self.is_attached:
+            await self.remove()
 
-    def action_cancel(self) -> None:
-        self._remove()
+    async def action_cancel(self) -> None:
+        await self._remove()
 
 
 class ChatMessage(Static):
@@ -1763,7 +1785,7 @@ class ChatMessage(Static):
         self.message_text = message
         self.update(content)
 
-    def on_click(self, event: Click) -> None:
+    async def on_click(self, event: Click) -> None:
         style = event.style
         value = style.meta.get("mitsu_copy") if style is not None else None
         if isinstance(value, str):
@@ -1778,7 +1800,7 @@ class ChatMessage(Static):
             event.stop()
             screen = self.screen
             if hasattr(screen, "_show_message_actions"):
-                screen._show_message_actions(self)
+                await screen._show_message_actions(self)
             return
 
 
@@ -1918,6 +1940,7 @@ class SessionScreen(Screen):
         Binding("ctrl+b", "toggle_chat_history", "Chat history", priority=True),
         Binding("ctrl+f", "search_chat", "Find in chat", priority=True),
         Binding("ctrl+t", "show_logs", "Logs", priority=True),
+        Binding("ctrl+u", "show_api_debug", "API debug", priority=True),
         Binding("escape", "cancel_agent", "Stop / latest", priority=True),
         Binding("shift+tab", "cycle_mode", "Switch mode", priority=True),
         Binding("pageup", "scroll_chat_up", "Scroll chat up", priority=True),
@@ -2057,6 +2080,10 @@ class SessionScreen(Screen):
         self._map_cancel: RequestCancellation | None = None
         self._map_task: asyncio.Task[None] | None = None
         self._map_logs: list[str] = []
+        self._api_debug_logs: list[str] = []
+        for entry in self.session.get("messages", []):
+            if isinstance(entry, dict) and entry.get("role") == "error":
+                self._record_api_debug(f"Saved session error\n{entry.get('text', '')}")
         self._report_cancel: RequestCancellation | None = None
         self._report_task: asyncio.Task[None] | None = None
         self._session_cleanup_task: asyncio.Task | None = None
@@ -3250,6 +3277,8 @@ class SessionScreen(Screen):
                     if isinstance(entry, dict) and entry.get("role") == "user"
                 ],
                 get_session_intel=lambda: self.intel,
+                claude_session_state=self.session,
+                codex_session_state=self.session,
             )
             async with aclosing(events):
                 async for event in events:
@@ -3266,7 +3295,13 @@ class SessionScreen(Screen):
                                 if isinstance(response_info, dict)
                                 else ""
                             )
-                            if isinstance(response_info, dict) and response_info.get("reasoning_only"):
+                            if isinstance(response_info, dict) and response_info.get("refusal"):
+                                message = (
+                                    "Claude refused this request. Your account connection is active, "
+                                    "but Claude returned no answer or tool call. Try a narrower request "
+                                    "or choose another configured provider."
+                                )
+                            elif isinstance(response_info, dict) and response_info.get("reasoning_only"):
                                 message = (
                                     "The provider sent internal reasoning but no reply or tool call. "
                                     "That private reasoning was not shown. Try again or select a model "
@@ -3295,6 +3330,10 @@ class SessionScreen(Screen):
                     elif event.kind == "usage":
                         self._record_usage(event.data.get("usage", {}))
                     elif event.kind == "api_retry":
+                        self._record_api_debug(
+                            f"Retry {event.data.get('attempt', 1)}/{event.data.get('max_attempts', 10)} "
+                            f"in {event.data.get('delay', 3)}s\n{event.data.get('error', 'Provider request failed.')}"
+                        )
                         await self._remove_stream_preview()
                         self._stream_characters = max(
                             0, self._stream_characters - self._current_request_characters
@@ -3373,6 +3412,7 @@ class SessionScreen(Screen):
                 self._set_companion("idle", "Mitsu is Ready to Pwn!")
                 await self._append_message("Stopped the current action.", "system")
         except ProviderRequestError as error:
+            self._record_api_debug(f"Request failed after retry handling\n{error}")
             await self._remove_stream_preview()
             if self._pending_redirects:
                 preserve_history()
@@ -3386,6 +3426,7 @@ class SessionScreen(Screen):
                 status.update(Text("⚠ API Error (｡•́︿•̀｡) · retries exhausted", style="bold #f07882"))
                 await self._append_message(str(error), "error")
         except Exception as error:
+            self._record_api_debug(f"Internal request error: {type(error).__name__}: {error}")
             await self._remove_stream_preview()
             if self._pending_redirects:
                 preserve_history()
@@ -4818,6 +4859,27 @@ class SessionScreen(Screen):
         logs = "\n\n".join(self._map_logs) or "No artifact errors have been logged in this session."
         self.app.push_screen(SessionLogsDialog(logs))
 
+    def action_show_api_debug(self) -> None:
+        profile = self.provider or {}
+        summary = (
+            f"Provider: {profile.get('provider_id', 'unknown')}\n"
+            f"Model: {profile.get('model', 'unknown')}\n"
+            f"Authentication: {profile.get('auth_method', 'API key')}\n\n"
+        )
+        logs = "\n\n".join(self._api_debug_logs) or "No API failures have been recorded in this session."
+        self.app.push_screen(APIDebugDialog(summary + logs))
+
+    def _record_api_debug(self, detail: str) -> None:
+        safe_detail = str(redact_value(detail))
+        profile = self.provider or {}
+        for key in ("api_key", "access_token", "refresh_token", "id_token"):
+            secret = str(profile.get(key, "") or "")
+            if secret:
+                safe_detail = safe_detail.replace(secret, "[REDACTED]")
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        self._api_debug_logs.append(f"[{stamp}] {safe_detail}")
+        del self._api_debug_logs[:-50]
+
     def _record_map_error(self, artifact_type: str = "map") -> None:
         detail = traceback.format_exc()
         now = datetime.now().astimezone()
@@ -5653,7 +5715,7 @@ CURRENT MODE: {self.mode}
             self.session.setdefault("messages", []).append(entry)
             self.sessions.save_session(self.session)
 
-    def _show_message_actions(self, message_widget: ChatMessage) -> None:
+    async def _show_message_actions(self, message_widget: ChatMessage) -> None:
         messages = self.session.get("messages", [])
         try:
             message_index = self._message_widgets.index(message_widget)
@@ -5673,23 +5735,21 @@ CURRENT MODE: {self.mode}
             actions.append("Stop")
         if can_rewind:
             actions.append("Rewind")
-        self._remove_message_actions_menu()
+        await self._remove_message_actions_menu()
         conversation = self.query_one("#conversation", ConversationScroll)
         menu = MessageActionsMenu(message_widget.message_text, message_index, self, actions)
-        conversation.mount(menu, after=message_widget)
+        await conversation.mount(menu, after=message_widget)
         conversation.scroll_to_widget(menu, animate=False)
         self._message_actions_menu = menu
 
 
-    def _remove_message_actions_menu(self) -> None:
+    async def _remove_message_actions_menu(self) -> None:
         menu = getattr(self, "_message_actions_menu", None)
         if menu is None:
             return
         self._message_actions_menu = None
-        try:
-            menu.remove()
-        except Exception:
-            pass
+        if menu.is_attached:
+            await menu.remove()
 
     def _message_action_selected(
         self,

@@ -85,7 +85,14 @@ class CredentialStore:
             # LiteLLM routes by model ID and needs a base URL only for self-hosted endpoints.
             if not profile.get("base_url") and spec.protocol != "litellm":
                 continue
-            if spec.requires_api_key and not profile.get("api_key"):
+            has_account_token = (
+                spec.id != "anthropic"
+                and profile.get("auth_method") == "account"
+                and profile.get("access_token")
+            )
+            has_claude_code = spec.id == "anthropic" and profile.get("auth_method") == "claude_code"
+            has_codex_cli = spec.id == "openai" and profile.get("auth_method") == "codex_cli"
+            if spec.requires_api_key and not profile.get("api_key") and not has_account_token and not has_claude_code and not has_codex_cli:
                 continue
             if spec.id == "cloudflare" and "{account_id}" in str(profile.get("base_url", "")):
                 continue
@@ -101,32 +108,72 @@ class CredentialStore:
         spec = PROVIDER_BY_ID.get(str(profile.get("provider_id")))
         if not spec:
             return False
-        if spec.requires_api_key and not profile.get("api_key"):
+        has_account_token = (
+            spec.id != "anthropic"
+            and profile.get("auth_method") == "account"
+            and profile.get("access_token")
+        )
+        has_claude_code = spec.id == "anthropic" and profile.get("auth_method") == "claude_code"
+        has_codex_cli = spec.id == "openai" and profile.get("auth_method") == "codex_cli"
+        if spec.requires_api_key and not profile.get("api_key") and not has_account_token and not has_claude_code and not has_codex_cli:
             return False
         return True
 
-    def save_profile(self, profile: dict[str, Any]) -> None:
+    def save_profile(self, profile: dict[str, Any], activate: bool = True) -> None:
         provider_id = str(profile["provider_id"])
         data = self.load()
         providers = data.get("providers")
         if not isinstance(providers, dict):
             providers = {}
         previous = providers.get(provider_id)
-        if not profile.get("api_key") and isinstance(previous, dict):
-            profile["api_key"] = previous.get("api_key", "")
-        providers[provider_id] = {
-            key: profile.get(key, "")
-            for key in (
-                "base_url",
-                "model",
-                "api_key",
-                "protocol",
-                "reasoning_enabled",
-                "reasoning_parameter",
-                "reasoning_effort",
-            )
-        }
-        data["active_provider"] = provider_id
+        stored = dict(previous) if isinstance(previous, dict) else {}
+        for key in (
+            "base_url",
+            "model",
+            "api_key",
+            "protocol",
+            "reasoning_enabled",
+            "reasoning_parameter",
+            "reasoning_effort",
+            "auth_method",
+            "access_token",
+            "refresh_token",
+            "expires_at",
+            "id_token",
+            "client_id",
+            "host_id",
+            "subject",
+            "email",
+            "scopes",
+            "nonce",
+        ):
+            if key in profile:
+                stored[key] = profile[key]
+        if (
+            not profile.get("api_key")
+            and profile.get("auth_method") not in {"account", "claude_code", "codex_cli"}
+            and isinstance(previous, dict)
+            and previous.get("api_key")
+        ):
+            stored["api_key"] = previous["api_key"]
+        providers[provider_id] = stored
+        if activate:
+            data["active_provider"] = provider_id
+        data["providers"] = providers
+        _atomic_json(self.path, data, private=True)
+
+    def update_auth_tokens(self, provider_id: str, tokens: dict[str, Any]) -> None:
+        data = self.load()
+        providers = data.get("providers")
+        if not isinstance(providers, dict):
+            providers = {}
+        profile = providers.get(provider_id)
+        if not isinstance(profile, dict):
+            return
+        for key in ("access_token", "refresh_token", "expires_at", "id_token", "scopes"):
+            if key in tokens:
+                profile[key] = tokens[key]
+        providers[provider_id] = profile
         data["providers"] = providers
         _atomic_json(self.path, data, private=True)
 

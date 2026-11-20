@@ -13,7 +13,8 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, OptionList, Static
 
 from mitsu.config import CredentialStore, PROVIDERS, PROVIDER_BY_ID
-from mitsu.providers import ProviderRequestError, apply_reasoning_default, list_models
+from mitsu.providers import ProviderRequestError, apply_reasoning_default, list_models, test_connection
+from mitsu.providers import codex_cli
 
 
 class ProviderDialog(ModalScreen[dict | None]):
@@ -29,6 +30,7 @@ class ProviderDialog(ModalScreen[dict | None]):
         self.all_model_choices: list[tuple[dict, str]] = []
         self.key_prompted = False
         self.endpoint_prompted = False
+        self.auth_method_prompted = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="provider-dialog"):
@@ -57,6 +59,8 @@ class ProviderDialog(ModalScreen[dict | None]):
             self.run_worker(self._load_all_models(), name="provider-dialog-models", exclusive=True)
         elif self.stage == "retry_provider_models":
             self.run_worker(self._load_provider_models(), name="provider-dialog-models", exclusive=True)
+        elif self.stage == "auth_method":
+            await self._choose_auth_method(event.option_index)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "provider-dialog-input" and self.stage == "model_list":
@@ -92,6 +96,10 @@ class ProviderDialog(ModalScreen[dict | None]):
                 return
             if value:
                 profile["api_key"] = value
+            profile["auth_method"] = "api_key"
+            profile["access_token"] = ""
+            profile["refresh_token"] = ""
+            profile["expires_at"] = 0
         elif stage == "account_id":
             if not re.fullmatch(r"[A-Fa-f0-9]{32}", value):
                 self.query_one("#provider-dialog-detail", Static).update(
@@ -141,6 +149,7 @@ class ProviderDialog(ModalScreen[dict | None]):
         }
         self.key_prompted = False
         self.endpoint_prompted = False
+        self.auth_method_prompted = False
         self._continue_connect()
 
     def _continue_connect(self) -> None:
@@ -149,6 +158,18 @@ class ProviderDialog(ModalScreen[dict | None]):
             return
         provider_id = str(profile["provider_id"])
         spec = PROVIDER_BY_ID[provider_id]
+        if provider_id in {"anthropic", "openai"} and not self.auth_method_prompted:
+            self.auth_method_prompted = True
+            self.stage = "auth_method"
+            name = "Anthropic" if provider_id == "anthropic" else "OpenAI"
+            self.query_one("#provider-dialog-title", Static).update(f"{name.upper()} SIGN-IN")
+            self.query_one("#provider-dialog-detail", Static).update(f"Choose how to connect {name}.")
+            listing = self.query_one("#provider-dialog-list", OptionList)
+            listing.clear_options()
+            listing.add_options(["Sign in with account", "Sign in with API key"])
+            listing.display = True
+            listing.focus()
+            return
         if provider_id == "custom" and not self.endpoint_prompted:
             self.endpoint_prompted = True
             self._request_input(
@@ -159,7 +180,7 @@ class ProviderDialog(ModalScreen[dict | None]):
                 initial_value=str(profile.get("base_url", "")),
             )
             return
-        if spec.requires_api_key and not self.key_prompted:
+        if spec.requires_api_key and profile.get("auth_method") not in {"account", "claude_code", "codex_cli"} and not self.key_prompted:
             self.key_prompted = True
             detail = f"Please input your API key for {spec.name}."
             if profile.get("api_key"):
@@ -183,6 +204,15 @@ class ProviderDialog(ModalScreen[dict | None]):
                 detail = "API key already set. Leave empty to keep it unchanged, or enter a replacement."
             self._request_input("api_key", "LITELLM API KEY", detail, "API key (optional)", True)
             return
+        if provider_id == "amazon_bedrock":
+            self._request_input(
+                "model_name",
+                "AMAZON BEDROCK MODEL",
+                "Enter a LiteLLM Bedrock model ID (bedrock/<model-or-inference-profile-id>). Install Mitsu's litellm extra and configure AWS credentials and region locally.",
+                "bedrock/model-id",
+                initial_value=str(profile.get("model", "")),
+            )
+            return
         if provider_id == "litellm":
             self._request_input(
                 "model_name",
@@ -195,10 +225,136 @@ class ProviderDialog(ModalScreen[dict | None]):
         if provider_id == "cloudflare" and not self._has_cloudflare_account(str(profile.get("base_url", ""))):
             self._request_input("account_id", "CLOUDFLARE ACCOUNT", "Enter the account ID for Workers AI.", "Account ID")
             return
+        if provider_id in {"zai", "mistral", "fireworks"}:
+            provider_name = PROVIDER_BY_ID[provider_id].name
+            examples = {
+                "zai": "glm-4.6",
+                "mistral": "mistral-small-latest",
+                "fireworks": "accounts/fireworks/models/llama-v3p1-8b-instruct",
+            }
+            self._request_input(
+                "model_name",
+                f"{provider_name.upper()} MODEL",
+                f"Enter a {provider_name} model ID, such as {examples[provider_id]}, from its model catalog.",
+                "Model ID",
+                initial_value=str(profile.get("model", "")),
+            )
+            return
+        if provider_id == "vercel_gateway":
+            self._request_input(
+                "model_name",
+                "VERCEL AI GATEWAY MODEL",
+                "Enter a provider/model ID from the Vercel AI Gateway model catalog, such as openai/gpt-5.4.",
+                "provider/model",
+                initial_value=str(profile.get("model", "")),
+            )
+            return
+        if provider_id == "ollama_cloud":
+            self._request_input(
+                "model_name",
+                "OLLAMA CLOUD MODEL",
+                "Enter an Ollama cloud model ID. Choose a model that supports tool calling for Mitsu agent actions.",
+                "Model ID",
+                initial_value=str(profile.get("model", "")),
+            )
+            return
         if provider_id == "custom":
             self._request_input("model_name", "MODEL NAME", "Enter the model ID exactly as the endpoint expects it.", "Model ID")
             return
         self.run_worker(self._load_provider_models(), name="provider-dialog-models", exclusive=True)
+
+    async def _choose_auth_method(self, index: int) -> None:
+        profile = self.pending_profile
+        if profile is None:
+            return
+        listing = self.query_one("#provider-dialog-list", OptionList)
+        listing.display = False
+        provider_id = str(profile.get("provider_id"))
+        if provider_id == "openai":
+            if index == 0:
+                profile["auth_method"] = "codex_cli"
+                profile["model"] = "default"
+                profile["api_key"] = ""
+                for key in (
+                    "access_token", "refresh_token", "expires_at", "id_token", "client_id",
+                    "host_id", "subject", "email", "scopes", "nonce",
+                ):
+                    profile[key] = 0 if key == "expires_at" else ""
+                self.stage = "codex_cli"
+                self.query_one("#provider-dialog-title", Static).update("OPENAI ACCOUNT SIGN-IN")
+                self.query_one("#provider-dialog-detail", Static).update(
+                    "Verifying Codex CLI account sign-in and model access…"
+                )
+                self.run_worker(self._finish_codex_login(), name="provider-dialog-openai-account", exclusive=True)
+                return
+        elif provider_id == "anthropic" and index == 0:
+            profile["auth_method"] = "claude_code"
+            profile["model"] = str(profile.get("model") or "opus")
+            profile["api_key"] = ""
+            for key in ("access_token", "refresh_token", "expires_at", "id_token"):
+                profile[key] = 0 if key == "expires_at" else ""
+            self.query_one("#provider-dialog-title", Static).update("VERIFYING CLAUDE CODE")
+            self.query_one("#provider-dialog-detail", Static).update(
+                "Checking the Claude Code binary, account login, and Opus model reply…"
+            )
+            try:
+                await asyncio.to_thread(test_connection, profile)
+            except ProviderRequestError as error:
+                self.stage = "auth_method"
+                self.auth_method_prompted = False
+                self.query_one("#provider-dialog-title", Static).update("CLAUDE CODE ACCOUNT")
+                self.query_one("#provider-dialog-detail", Static).update(str(error))
+                listing.clear_options()
+                listing.add_options(["Check Claude Code again", "Use API key"])
+                listing.display = True
+                listing.focus()
+                return
+            self.auth_method_prompted = True
+            self._continue_connect()
+            return
+        profile["auth_method"] = "api_key"
+        self.auth_method_prompted = True
+        for key in ("access_token", "refresh_token", "expires_at", "id_token"):
+            profile[key] = 0 if key == "expires_at" else ""
+        self.key_prompted = False
+        self._continue_connect()
+
+    async def _finish_codex_login(self) -> None:
+        profile = self.pending_profile
+        if profile is None:
+            return
+        try:
+            await asyncio.to_thread(codex_cli.sign_in)
+        except ProviderRequestError as error:
+            self.stage = "auth_method"
+            self.query_one("#provider-dialog-title", Static).update("OPENAI ACCOUNT SIGN-IN")
+            self.query_one("#provider-dialog-detail", Static).update(str(error))
+            listing = self.query_one("#provider-dialog-list", OptionList)
+            listing.clear_options()
+            listing.add_options(["Try account sign-in again", "Use API key"])
+            listing.display = True
+            listing.focus()
+            return
+        self.query_one("#provider-dialog-title", Static).update("VERIFYING OPENAI ACCOUNT")
+        self.query_one("#provider-dialog-detail", Static).update(
+            "Checking that Mitsu can receive a model reply from this account…"
+        )
+        try:
+            await asyncio.to_thread(test_connection, profile)
+        except ProviderRequestError as error:
+            self.stage = "auth_method"
+            self.query_one("#provider-dialog-title", Static).update("OPENAI ACCOUNT SIGN-IN")
+            self.query_one("#provider-dialog-detail", Static).update(
+                f"Account sign-in completed, but model verification failed:\n{error}"
+            )
+            listing = self.query_one("#provider-dialog-list", OptionList)
+            listing.clear_options()
+            listing.add_options(["Try account sign-in again", "Use API key"])
+            listing.display = True
+            listing.focus()
+            return
+        self.auth_method_prompted = True
+        self._continue_connect()
 
     def _request_input(
         self,
@@ -349,6 +505,17 @@ class ProviderDialog(ModalScreen[dict | None]):
             selected["reasoning_parameter"] = ""
             selected["reasoning_effort"] = "medium"
         selected["model"] = model
+        if selected.get("provider_id") == "anthropic" and selected.get("auth_method") == "claude_code":
+            self.query_one("#provider-dialog-detail", Static).update(
+                f"Verifying Claude Code account and {model} response before saving…"
+            )
+            try:
+                await asyncio.to_thread(test_connection, selected)
+            except ProviderRequestError as error:
+                self.query_one("#provider-dialog-detail", Static).update(
+                    f"The selected Claude model did not pass verification:\n{error}"
+                )
+                return
         if not isinstance(selected.get("reasoning_enabled"), bool):
             self.query_one("#provider-dialog-detail", Static).update("Checking model reasoning support…")
             try:
